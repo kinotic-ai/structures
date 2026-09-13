@@ -94,7 +94,8 @@ the reaper write back the `lastSeen` they read. A heartbeat inside their read-to
 overwritten with the older value. It can reap a live node only when two heartbeat intervals exceed
 the timeout (defaults 30 s against 90 s cannot), but the two knobs are set independently on node and
 server. Fix: partial updates for status and allocation through `CrudServiceTemplate.partialUpdateSync`,
-exposed as `VmNodeService.updateStatusSync` and `updateAllocationSync`, so only a heartbeat or a
+exposed as `VmNodeService.updateStatusSync` and, for the allocation, `reserveSync`/`releaseSync`
+(scripted updates that are atomic per node, so concurrent deploys cannot both take the same room), so only a heartbeat or a
 registration ever writes `lastSeen`. Also: the reaper skips `STOPPING`, so a workload whose stop
 failed on a dead node stays STOPPING forever; include it.
 

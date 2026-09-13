@@ -33,9 +33,15 @@ public class DefaultVmNodeService extends AbstractCrudService<VmNode> implements
     }
 
     @Override
-    public Future<Void> updateAllocationSync(String nodeId, int availableCpus, int availableMemoryMb, int availableDiskMb) {
+    public Future<Boolean> reserveSync(String nodeId, int cpus, int memoryMb, int diskMb) {
         Validate.notNull(nodeId, "VmNode id cannot be null");
-        return vmNodeRepository.updateAllocationSync(nodeId, availableCpus, availableMemoryMb, availableDiskMb);
+        return vmNodeRepository.reserveSync(nodeId, cpus, memoryMb, diskMb);
+    }
+
+    @Override
+    public Future<Void> releaseSync(String nodeId, int cpus, int memoryMb, int diskMb) {
+        Validate.notNull(nodeId, "VmNode id cannot be null");
+        return vmNodeRepository.releaseSync(nodeId, cpus, memoryMb, diskMb);
     }
 
     @Override

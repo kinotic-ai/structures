@@ -510,8 +510,9 @@ dropped instead of ending the connection, and a TS service drops results for inv
 connection; `VertxFutureRpcReturnValueHandler` completes idempotently; lease keys are qualified per
 connection; a CONNECTION keep-alive touches the session at connect and every quarter of the timeout;
 a control event earns no reply grant; a reused subscription id ends its predecessor; a requester whose
-listener is gone is answered as well as cancelled; VmNode status and allocation are partial updates so
-only a heartbeat writes `lastSeen`, and the reaper takes STOPPING workloads with the rest; the TS
+listener is gone is answered as well as cancelled; VmNode status is a partial update and the allocation an atomic scripted
+reservation and release, so only a heartbeat writes `lastSeen` and two concurrent deploys can never both
+take a node's last room; the reaper takes STOPPING workloads with the rest; the TS
 supervisor stops a synchronous stream on its first unsendable value, answers with the
 `{exceptionName, exceptionClass, errorMessage}` shape every runtime reads, and the vm-manager bounds
 its graceful disconnect on shutdown.

@@ -7,6 +7,7 @@ import co.elastic.clients.elasticsearch._types.FieldSort;
 import co.elastic.clients.elasticsearch._types.FieldValue;
 import co.elastic.clients.elasticsearch._types.OpType;
 import co.elastic.clients.elasticsearch._types.Refresh;
+import co.elastic.clients.elasticsearch._types.Result;
 import co.elastic.clients.elasticsearch._types.SortOrder;
 import co.elastic.clients.elasticsearch._types.mapping.DynamicMapping;
 import co.elastic.clients.elasticsearch._types.mapping.Property;
@@ -19,6 +20,7 @@ import co.elastic.clients.elasticsearch.core.mget.MultiGetResponseItem;
 import co.elastic.clients.elasticsearch.core.search.Hit;
 import co.elastic.clients.elasticsearch.core.search.HitsMetadata;
 import co.elastic.clients.elasticsearch.indices.*;
+import co.elastic.clients.json.JsonData;
 import co.elastic.clients.json.JsonpDeserializer;
 import co.elastic.clients.json.JsonpMapperBase;
 import co.elastic.clients.transport.JsonEndpoint;
@@ -41,6 +43,7 @@ import tools.jackson.databind.type.TypeFactory;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
@@ -624,6 +627,36 @@ public class CrudServiceTemplate {
                                                         .refresh(Refresh.WaitFor),
                                                   Map.class)
                                           .thenApply(response -> null));
+    }
+
+    /**
+     * Runs a Painless script against a document using {@link Refresh#WaitFor}, guaranteeing read-your-write
+     * semantics for subsequent queries. The script reads and writes the document in one shard operation, so a
+     * read-modify-write expressed in it cannot lose a concurrent writer's change; a conflicting concurrent
+     * write is retried server-side. A script that sets {@code ctx.op} to {@code noop} leaves the document as
+     * it is and the future completes with false.
+     *
+     * @param indexName name of the index
+     * @param id        of the document to update
+     * @param source    the Painless source, reading its inputs from {@code params}
+     * @param params    the values the script reads as {@code params.<name>}
+     * @return a {@link Future} that will complete with true when the script changed the document and false
+     * when it declined, or fail when the document does not exist
+     */
+    public Future<Boolean> scriptedUpdateSync(String indexName,
+                                              String id,
+                                              String source,
+                                              Map<String, Object> params) {
+        Map<String, JsonData> scriptParams = new HashMap<>();
+        params.forEach((name, value) -> scriptParams.put(name, JsonData.of(value)));
+        return toFuture(esAsyncClient.update(u -> u.index(indexName)
+                                                        .id(id)
+                                                        .script(s -> s.source(src -> src.scriptString(source))
+                                                                      .params(scriptParams))
+                                                        .retryOnConflict(UPDATE_CONFLICT_RETRIES)
+                                                        .refresh(Refresh.WaitFor),
+                                                  Map.class)
+                                          .thenApply(response -> response.result() != Result.NoOp));
     }
 
     /**
