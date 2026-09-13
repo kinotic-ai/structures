@@ -61,7 +61,10 @@ public class WorkloadOrchestrationTest {
     void setUp() {
         workloads = new StubWorkloadService();
         nodes = new StubVmNodeService();
+        // a node with room for the default workload; a deploy reserves on the stored record
         nodes.availableNode = new VmNode(NODE_ID, "node-1", "host-1");
+        nodes.availableNode.setTotalCpus(4).setTotalMemoryMb(4096).setTotalDiskMb(10240)
+                           .setAvailableCpus(4).setAvailableMemoryMb(4096).setAvailableDiskMb(10240);
         nodes.saveSync(nodes.availableNode);
         vmManager = new StubVmManagerProxy();
         // the node's vm-manager registration, as the cluster reports it: absent unless a test says otherwise
@@ -325,6 +328,33 @@ public class WorkloadOrchestrationTest {
 
         assertTrue(run.failed());
         assertNull(vmManager.lastStarted);
+    }
+
+    @Test
+    public void concurrentDeploysCannotOverAllocateANode() throws Exception {
+        // room for exactly one of the two workloads; the placement returns the same node to both
+        nodes.availableNode = registeredNode(NODE_ID, 1, 4096, 10240);
+
+        Future<Workload> first = orchestration.deployWorkload(newWorkload().setVcpus(1));
+        Future<Workload> second = orchestration.deployWorkload(newWorkload().setVcpus(1));
+        Future.join(first, second).toCompletionStage().toCompletableFuture().handle((v, t) -> null).get(5, TimeUnit.SECONDS);
+
+        assertTrue(first.succeeded() != second.succeeded(), "exactly one deploy may hold the node's last vCPU");
+        assertEquals(0, nodes.saved.get(NODE_ID).getAvailableCpus());
+        assertEquals(1, vmManager.started.size());
+    }
+
+    @Test
+    public void destroyReturnsTheWorkloadsReservation() throws Exception {
+        nodes.availableNode = registeredNode(NODE_ID, 4, 4096, 10240);
+
+        Workload deployed = await(orchestration.deployWorkload(newWorkload()));
+        assertEquals(4 - deployed.getVcpus(), nodes.saved.get(NODE_ID).getAvailableCpus());
+
+        await(orchestration.destroyWorkload(deployed.getId()));
+        assertEquals(4, nodes.saved.get(NODE_ID).getAvailableCpus());
+        assertEquals(4096, nodes.saved.get(NODE_ID).getAvailableMemoryMb());
+        assertEquals(10240, nodes.saved.get(NODE_ID).getAvailableDiskMb());
     }
 
     @Test

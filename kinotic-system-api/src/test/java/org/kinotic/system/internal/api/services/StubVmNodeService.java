@@ -19,7 +19,8 @@ import java.util.function.Consumer;
  * returned as serialization round-trips the way Elasticsearch documents are, so a caller's
  * mutation of an entity after a save never alters the stored record, and a full save writes
  * back exactly what the caller's copy holds. The partial updates change only their fields on
- * the stored record and fail when the node has no record, as the real update does.
+ * the stored record, atomically per node, and fail when the node has no record, as the real
+ * updates do.
  */
 public class StubVmNodeService implements VmNodeService {
 
@@ -40,24 +41,35 @@ public class StubVmNodeService implements VmNodeService {
     }
 
     @Override
-    public Future<Void> updateAllocationSync(String nodeId, int availableCpus, int availableMemoryMb, int availableDiskMb) {
-        return update(nodeId, node -> node.setAvailableCpus(availableCpus)
-                                          .setAvailableMemoryMb(availableMemoryMb)
-                                          .setAvailableDiskMb(availableDiskMb));
+    public Future<Boolean> reserveSync(String nodeId, int cpus, int memoryMb, int diskMb) {
+        boolean[] reserved = new boolean[1];
+        // one node's reservations serialize under the map's lock, as the scripted update does on the shard
+        return update(nodeId, node -> {
+            reserved[0] = node.getAvailableCpus() >= cpus && node.getAvailableMemoryMb() >= memoryMb && node.getAvailableDiskMb() >= diskMb;
+            if (reserved[0]) {
+                node.setAvailableCpus(node.getAvailableCpus() - cpus)
+                    .setAvailableMemoryMb(node.getAvailableMemoryMb() - memoryMb)
+                    .setAvailableDiskMb(node.getAvailableDiskMb() - diskMb);
+            }
+        }).map(v -> reserved[0]);
+    }
+
+    @Override
+    public Future<Void> releaseSync(String nodeId, int cpus, int memoryMb, int diskMb) {
+        return update(nodeId, node -> node.setAvailableCpus(Math.min(node.getTotalCpus(), node.getAvailableCpus() + cpus))
+                                          .setAvailableMemoryMb(Math.min(node.getTotalMemoryMb(), node.getAvailableMemoryMb() + memoryMb))
+                                          .setAvailableDiskMb(Math.min(node.getTotalDiskMb(), node.getAvailableDiskMb() + diskMb)));
     }
 
     private Future<Void> update(String nodeId, Consumer<VmNode> partial) {
-        Future<Void> ret;
-        VmNode stored = saved.get(nodeId);
-        if (stored == null) {
-            ret = Future.failedFuture(new IllegalStateException("No VmNode record for " + nodeId));
-        } else {
-            partial.accept(stored);
-            // re-put so a reader on another thread sees the mutation through the map's happens-before
-            saved.put(nodeId, stored);
-            ret = Future.succeededFuture();
-        }
-        return ret;
+        // computeIfPresent holds the entry's lock while partial runs, and the re-put publishes the mutation
+        VmNode stored = saved.computeIfPresent(nodeId, (_, node) -> {
+            partial.accept(node);
+            return node;
+        });
+        return stored == null
+                ? Future.failedFuture(new IllegalStateException("No VmNode record for " + nodeId))
+                : Future.succeededFuture();
     }
 
     @Override
