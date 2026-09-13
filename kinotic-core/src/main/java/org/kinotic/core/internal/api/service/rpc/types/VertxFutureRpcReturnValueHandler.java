@@ -47,14 +47,15 @@ public class VertxFutureRpcReturnValueHandler implements RpcReturnValueHandler {
     public boolean processResponse(Event<byte[]> incomingEvent) {
         try{
             // Error data is returned differently
+            // the reply and a lost-node failure run on different contexts and can both reach this promise
             if(incomingEvent.metadata().contains(EventConstants.ERROR_HEADER)) {
-                promise.fail(exceptionConverter.convert(incomingEvent));
+                promise.tryFail(exceptionConverter.convert(incomingEvent));
             }else{
-                promise.complete(rpcResponseConverter.convert(incomingEvent, methodParameter));
+                promise.tryComplete(rpcResponseConverter.convert(incomingEvent, methodParameter));
             }
         }catch (Exception e){
             log.error("Error converting the incoming message to expected java type", e);
-            promise.fail(e);
+            promise.tryFail(e);
         }
         return true;
     }
@@ -72,12 +73,12 @@ public class VertxFutureRpcReturnValueHandler implements RpcReturnValueHandler {
 
     @Override
     public void processError(Throwable throwable) {
-        promise.fail(throwable);
+        promise.tryFail(throwable);
     }
 
     @Override
     public void cancel(String message) {
-        promise.fail(message);
+        promise.tryFail(message);
     }
 
 }

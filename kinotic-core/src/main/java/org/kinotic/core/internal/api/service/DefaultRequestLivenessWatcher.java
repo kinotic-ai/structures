@@ -63,7 +63,13 @@ public class DefaultRequestLivenessWatcher implements RequestLivenessWatcher {
     @Override
     public void watch(String correlationId, String nodeId, Runnable onLost) {
         leases.put(correlationId, new Lease(nodeId, onLost, vertx.getOrCreateContext()));
-        correlationIdsByNode.computeIfAbsent(nodeId, _ -> ConcurrentHashMap.newKeySet()).add(correlationId);
+        // the add runs under the key's lock, so a concurrent settle() emptying and dropping this node's set
+        // cannot leave the id in a set that is no longer in the map
+        correlationIdsByNode.compute(nodeId, (_, correlationIds) -> {
+            Set<String> ret = correlationIds != null ? correlationIds : ConcurrentHashMap.newKeySet();
+            ret.add(correlationId);
+            return ret;
+        });
         // The node may have left between the acknowledgement and this call; the latest snapshot decides,
         // and membershipChanged catches a departure that lands while this method runs
         Set<String> current = members;
@@ -76,10 +82,7 @@ public class DefaultRequestLivenessWatcher implements RequestLivenessWatcher {
     public void settle(String correlationId) {
         Lease lease = leases.remove(correlationId);
         if(lease != null){
-            correlationIdsByNode.computeIfPresent(lease.nodeId(), (_, correlationIds) -> {
-                correlationIds.remove(correlationId);
-                return correlationIds.isEmpty() ? null : correlationIds;
-            });
+            unindex(lease.nodeId(), correlationId);
         }
     }
 
@@ -109,8 +112,16 @@ public class DefaultRequestLivenessWatcher implements RequestLivenessWatcher {
     private void lose(String correlationId) {
         Lease lease = leases.remove(correlationId);
         if(lease != null){
+            unindex(lease.nodeId(), correlationId);
             lease.context().runOnContext(_ -> lease.onLost().run());
         }
+    }
+
+    private void unindex(String nodeId, String correlationId) {
+        correlationIdsByNode.computeIfPresent(nodeId, (_, correlationIds) -> {
+            correlationIds.remove(correlationId);
+            return correlationIds.isEmpty() ? null : correlationIds;
+        });
     }
 
     private record Lease(String nodeId, Runnable onLost, Context context) {}

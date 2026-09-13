@@ -10,6 +10,10 @@ import io.vertx.core.eventbus.MessageConsumer;
 import org.awaitility.Awaitility;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
+import org.kinotic.core.api.exceptions.RpcServiceUnavailableException;
+import org.kinotic.core.internal.api.service.rpc.RpcReturnValueHandlerFactory;
+import org.kinotic.core.internal.api.service.rpc.RpcRequest;
+import org.kinotic.core.internal.api.service.rpc.RpcReturnValueHandler;
 import org.kinotic.core.api.Kinotic;
 import org.kinotic.core.api.event.CRI;
 import org.kinotic.core.api.event.Event;
@@ -71,6 +75,8 @@ public class RpcTests {
     private Vertx vertx;
     @Autowired
     private SecurityContext securityContext;
+    @Autowired
+    private RpcReturnValueHandlerFactory rpcReturnValueHandlerFactory;
 
     private static final String PARTICIPANT_ID = "test-participant";
 
@@ -443,6 +449,42 @@ public class RpcTests {
         } finally {
             serviceConsumer.unregister();
         }
+    }
+
+    @Test
+    public void testFutureHandlerSettlesOnceUnderCompetingSignals() throws Exception {
+        // a lost-node failure and a reply reach the same handler from different contexts; the second signal is dropped
+        RpcReturnValueHandler handler = rpcReturnValueHandlerFactory.createReturnValueHandler(
+                RpcTestServiceProxy.class.getMethod("getAnotherString"), new Object[0]);
+        @SuppressWarnings("unchecked")
+        Future<String> future = (Future<String>) handler.getReturnValue(new RpcRequest() {
+            @Override
+            public void send() {}
+            @Override
+            public void cancelRequest() {}
+        });
+        handler.processError(new RpcServiceUnavailableException("node left"));
+        handler.processError(new IllegalStateException("late"));
+        handler.cancel("released");
+
+        Assertions.assertTrue(future.failed());
+        Assertions.assertInstanceOf(RpcServiceUnavailableException.class, future.cause());
+    }
+
+    @Test
+    public void testInvocationsOfOneServiceOverlap(){
+        // four calls whose results complete 500 ms later, off the delivery context; they are dispatched on
+        // the service's context and must not wait on one another
+        long start = System.currentTimeMillis();
+        List<CompletableFuture<String>> calls = new ArrayList<>();
+        for(int i = 0; i < 4; i++){
+            calls.add(rpcTestServiceProxy.getMonoAfterDelay("done", 500).toFuture());
+        }
+        for(CompletableFuture<String> call : calls){
+            Assertions.assertEquals("done", call.orTimeout(10, TimeUnit.SECONDS).join());
+        }
+        long elapsed = System.currentTimeMillis() - start;
+        Assertions.assertTrue(elapsed < 1500, "four 500 ms results took " + elapsed + " ms, so they were serialized");
     }
 
     @Test

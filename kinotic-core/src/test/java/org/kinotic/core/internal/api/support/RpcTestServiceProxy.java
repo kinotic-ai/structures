@@ -63,6 +63,8 @@ public interface RpcTestServiceProxy {
 
     Mono<String> getMonoWithValue();
 
+    Mono<String> getMonoAfterDelay(String value, long delayMillis);
+
     Mono<Void> getMonoWithVoidFromEmpty();
 
     Mono<Void> getMonoWithVoidFromNull();

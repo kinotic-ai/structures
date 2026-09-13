@@ -130,17 +130,20 @@ public class McpToolInvoker {
         eventBusService.sendWithAck(event)
                        .onComplete(ar -> {
                            if (ar.failed()) {
-                               // a failed send never gets a reply, so its pending entry is removed here
-                               pendingCalls.remove(correlationId);
-                               // mapSendFailure also reports unreachability to the directory on NO_HANDLERS
-                               Throwable mapped = KinoticUtil.mapSendFailure(ar.cause(), requestCri, serviceDirectory);
-                               if (mapped instanceof RpcMissingServiceException) {
-                                   ret.complete(McpCallToolResult.error("Service is offline: " + tool.getCri()));
-                               } else if (mapped instanceof RpcServiceUnavailableException) {
-                                   ret.complete(McpCallToolResult.error("Service became unavailable: " + tool.getCri()));
-                               } else {
-                                   log.warn("MCP tool '{}' dispatch to {} failed", tool.getName(), tool.getCri(), ar.cause());
-                                   ret.complete(McpCallToolResult.error(ar.cause().getMessage()));
+                               // only the party that removes the entry completes it: a reply can land before an
+                               // acknowledgement times out
+                               Promise<McpCallToolResult> unsent = pendingCalls.remove(correlationId);
+                               if (unsent != null) {
+                                   // mapSendFailure also reports unreachability to the directory on NO_HANDLERS
+                                   Throwable mapped = KinoticUtil.mapSendFailure(ar.cause(), requestCri, serviceDirectory);
+                                   if (mapped instanceof RpcMissingServiceException) {
+                                       unsent.complete(McpCallToolResult.error("Service is offline: " + tool.getCri()));
+                                   } else if (mapped instanceof RpcServiceUnavailableException) {
+                                       unsent.complete(McpCallToolResult.error("Service became unavailable: " + tool.getCri()));
+                                   } else {
+                                       log.warn("MCP tool '{}' dispatch to {} failed", tool.getName(), tool.getCri(), ar.cause());
+                                       unsent.complete(McpCallToolResult.error(ar.cause().getMessage()));
+                                   }
                                }
                            } else {
                                // computeIfPresent serializes with the reply handler's remove, so a reply that

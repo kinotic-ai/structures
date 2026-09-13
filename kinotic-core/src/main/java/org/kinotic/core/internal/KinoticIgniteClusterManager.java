@@ -187,13 +187,14 @@ public class KinoticIgniteClusterManager extends IgniteClusterManager {
         });
     }
 
-    // The snapshot is taken on the calling thread and emitted on the delivery context; a seed queued
-    // behind a membership event must not overwrite that event's newer snapshot with its stale one
+    // The snapshot is taken on the delivery context, where emissions are serialised, so two membership
+    // events handled on different worker threads cannot emit their snapshots out of order; a seed queued
+    // behind a membership event does not overwrite that event's snapshot
     private void emitClusterNodes(boolean seed) {
-        Set<String> nodes = Set.copyOf(getNodes());
         deliveryContext().runOnContext(v -> {
             if(!seed || !clusterNodesEmitted){
                 clusterNodesEmitted = true;
+                Set<String> nodes = Set.copyOf(getNodes());
                 Sinks.EmitResult result = clusterNodesSink.tryEmitNext(nodes);
                 if(result.isFailure()){
                     log.warn("Failed to emit cluster nodes {}: {}", nodes, result);

@@ -36,6 +36,7 @@ import org.kinotic.gateway.api.config.ApiGatewayProperties;
 import org.kinotic.gateway.internal.endpoints.Services;
 import org.mockito.ArgumentCaptor;
 import org.springframework.beans.factory.ObjectProvider;
+import reactor.core.publisher.Flux;
 import reactor.core.publisher.Sinks;
 import tools.jackson.databind.json.JsonMapper;
 
@@ -43,14 +44,18 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.endsWith;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -139,7 +144,7 @@ public class EndpointConnectionHandlerTests {
         handler.send(request(replyTo, "corr-1")).toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
 
         ArgumentCaptor<Runnable> onLost = ArgumentCaptor.forClass(Runnable.class);
-        verify(requestLivenessWatcher).watch(eq("corr-1"), eq("node-2"), onLost.capture());
+        verify(requestLivenessWatcher).watch(endsWith(":corr-1"), eq("node-2"), onLost.capture());
         onLost.getValue().run();
 
         ArgumentCaptor<Event<byte[]>> sent = ArgumentCaptor.forClass(Event.class);
@@ -159,13 +164,13 @@ public class EndpointConnectionHandlerTests {
         // the subscription handler the test installed receives what the reply consumer delivers
         handler.send(request(replyTo, "corr-2")).toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
         ArgumentCaptor<Runnable> onLost = ArgumentCaptor.forClass(Runnable.class);
-        verify(requestLivenessWatcher).watch(eq("corr-2"), eq("node-2"), onLost.capture());
+        verify(requestLivenessWatcher).watch(endsWith(":corr-2"), eq("node-2"), onLost.capture());
 
         Metadata replyMetadata = Metadata.create(Map.of(EventConstants.CORRELATION_ID_HEADER, "corr-2",
                                                         EventConstants.CONTROL_HEADER, EventConstants.CONTROL_VALUE_COMPLETE));
         replyDelivery.get().handle(Event.create(CRI.create(replyTo), replyMetadata, new byte[0]));
 
-        verify(requestLivenessWatcher).settle("corr-2");
+        verify(requestLivenessWatcher).settle(endsWith(":corr-2"));
         // a node loss reported after the reply has nothing left to answer
         onLost.getValue().run();
         verify(eventBusService, never()).send(any());
@@ -179,7 +184,7 @@ public class EndpointConnectionHandlerTests {
 
         handler.shutdown();
 
-        verify(requestLivenessWatcher).settle("corr-3");
+        verify(requestLivenessWatcher).settle(endsWith(":corr-3"));
         verify(replyConsumer).unregister();
     }
 
@@ -248,20 +253,156 @@ public class EndpointConnectionHandlerTests {
         verify(eventBusService).monitorListenerStatus(watched.capture());
         Assertions.assertEquals(requester, watched.getValue().raw());
 
+        // the requester's answer is written on the connection's context, after the cancel frame
+        CountDownLatch answered = new CountDownLatch(1);
+        doAnswer(_ -> { answered.countDown(); return null; }).when(eventBusService).send(any());
         requesterStatus.tryEmitNext(ListenerStatus.INACTIVE);
-        long deadline = System.currentTimeMillis() + 5000;
-        while (delivered.size() < 2 && System.currentTimeMillis() < deadline) {
-            Thread.sleep(50);
-        }
+        Assertions.assertTrue(answered.await(5, TimeUnit.SECONDS), "the requester was never answered");
         Assertions.assertEquals(2, delivered.size(), "no cancel reached the connection");
         Event<byte[]> cancel = delivered.get(1);
         Assertions.assertEquals(SERVICE_DESTINATION, cancel.cri().raw());
         Assertions.assertEquals(EventConstants.CONTROL_VALUE_CANCEL, cancel.metadata().get(EventConstants.CONTROL_HEADER));
         Assertions.assertEquals("inv-3", cancel.metadata().get(EventConstants.CORRELATION_ID_HEADER));
 
-        // the cancelled invocation is no longer owed: the forwarded value is the only send, the close adds none
+        // the requester is answered with the typed error, so one whose registration this node had not seen
+        // yet learns the stream is over; the cancelled invocation is no longer owed, so the close adds nothing
         handler.shutdown();
-        verify(eventBusService).send(any());
+        ArgumentCaptor<Event<byte[]>> sent = ArgumentCaptor.forClass(Event.class);
+        verify(eventBusService, times(2)).send(sent.capture());
+        Event<byte[]> answer = sent.getAllValues().get(1);
+        Assertions.assertEquals(requester, answer.cri().raw());
+        Assertions.assertEquals("inv-3", answer.metadata().get(EventConstants.CORRELATION_ID_HEADER));
+        Assertions.assertNotNull(answer.metadata().get(EventConstants.ERROR_HEADER));
+    }
+
+    @Test
+    public void testEveryReplyOfAPendingInvocationIsAllowed() throws Exception {
+        when(eventBusService.monitorListenerStatus(any())).thenReturn(Flux.just(ListenerStatus.ACTIVE));
+        EndpointConnectionHandler handler = connect(Map.of());
+        String requester = EventConstants.REPLY_DESTINATION_SCHEME + "://other:replies@kinotic.js.EventBus/replyHandler";
+        deliverInvocation(handler, requester, "inv-4");
+
+        // two stream values, then the completion
+        for (int i = 0; i < 2; i++) {
+            Metadata valueMetadata = Metadata.create(Map.of(EventConstants.CORRELATION_ID_HEADER, "inv-4"));
+            handler.send(Event.create(CRI.create(requester), valueMetadata, new byte[0])).toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+        }
+        Metadata completion = Metadata.create(Map.of(EventConstants.CORRELATION_ID_HEADER, "inv-4",
+                                                     EventConstants.CONTROL_HEADER, EventConstants.CONTROL_VALUE_COMPLETE));
+        handler.send(Event.create(CRI.create(requester), completion, new byte[0])).toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+        verify(eventBusService, times(3)).send(any());
+
+        // the invocation is over: a further reply to the requester is dropped, and the connection lives on
+        Metadata late = Metadata.create(Map.of(EventConstants.CORRELATION_ID_HEADER, "inv-4"));
+        Assertions.assertTrue(handler.send(Event.create(CRI.create(requester), late, new byte[0])).succeeded());
+        verify(eventBusService, times(3)).send(any());
+    }
+
+    @Test
+    public void testControlEventEarnsNoReplyGrant() throws Exception {
+        EndpointConnectionHandler handler = connect(Map.of());
+        String requester = EventConstants.REPLY_DESTINATION_SCHEME + "://other:replies@kinotic.js.EventBus/replyHandler";
+        List<Event<byte[]>> delivered = new ArrayList<>();
+        handler.subscribe(CRI.create("srv://app.acme-org.orders-app~OrderService#1.0.0"), "svc-1", new StompSubscriptionHandler() {
+            @Override
+            public void handleEvent(Event<byte[]> event) {
+                delivered.add(event);
+            }
+
+            @Override
+            public void handleError(Throwable throwable) {}
+        });
+        // a requester's cancel names a stream this connection never held; it carries a reply-to like every request
+        Metadata cancel = Metadata.create(Map.of(EventConstants.REPLY_TO_HEADER, requester,
+                                                 EventConstants.CORRELATION_ID_HEADER, "inv-5",
+                                                 EventConstants.CONTROL_HEADER, EventConstants.CONTROL_VALUE_CANCEL));
+        replyDelivery.get().handle(Event.create(CRI.create(SERVICE_DESTINATION), cancel, null));
+        Assertions.assertEquals(1, delivered.size());
+
+        // nothing is owed to that requester and the cancel granted nothing, so a reply to it goes nowhere
+        Metadata reply = Metadata.create(Map.of(EventConstants.CORRELATION_ID_HEADER, "inv-5"));
+        Assertions.assertTrue(handler.send(Event.create(CRI.create(requester), reply, new byte[0])).succeeded());
+        verify(eventBusService, never()).send(any());
+    }
+
+    @Test
+    public void testClientCancelIsPublishedToEveryInstance() throws Exception {
+        EndpointConnectionHandler handler = connect(Map.of());
+        String replyTo = subscribeReplies(handler);
+        handler.send(request(replyTo, "inv-6")).toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+
+        Metadata metadata = Metadata.create(Map.of(EventConstants.REPLY_TO_HEADER, replyTo,
+                                                   EventConstants.CORRELATION_ID_HEADER, "inv-6",
+                                                   EventConstants.CONTROL_HEADER, EventConstants.CONTROL_VALUE_CANCEL));
+        handler.send(Event.create(CRI.create(SERVICE_DESTINATION), metadata, null)).toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+
+        // the request went to one instance; the cancel reaches all of them and settles the lease
+        verify(eventBusService, times(1)).sendWithAck(any());
+        ArgumentCaptor<Event<byte[]>> published = ArgumentCaptor.forClass(Event.class);
+        verify(eventBusService).publish(published.capture());
+        Assertions.assertEquals(EventConstants.CONTROL_VALUE_CANCEL, published.getValue().metadata().get(EventConstants.CONTROL_HEADER));
+        verify(requestLivenessWatcher).settle(endsWith(":inv-6"));
+    }
+
+    @Test
+    public void testLeasesAreQualifiedPerConnection() throws Exception {
+        EndpointConnectionHandler first = connect(Map.of());
+        EndpointConnectionHandler second = connect(Map.of());
+        String firstReplyTo = subscribeReplies(first);
+        String secondReplyTo = subscribeReplies(second);
+
+        // two clients on one gateway using the same correlation id
+        first.send(request(firstReplyTo, "dup")).toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+        second.send(request(secondReplyTo, "dup")).toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+        ArgumentCaptor<String> leases = ArgumentCaptor.forClass(String.class);
+        verify(requestLivenessWatcher, times(2)).watch(leases.capture(), eq("node-2"), any());
+        Assertions.assertNotEquals(leases.getAllValues().get(0), leases.getAllValues().get(1));
+
+        // the first client's terminal reply settles its own lease only
+        Metadata completion = Metadata.create(Map.of(EventConstants.CORRELATION_ID_HEADER, "dup",
+                                                     EventConstants.CONTROL_HEADER, EventConstants.CONTROL_VALUE_COMPLETE));
+        replyDelivery.get().handle(Event.create(CRI.create(secondReplyTo), completion, new byte[0]));
+        verify(requestLivenessWatcher, times(1)).settle(any());
+        verify(requestLivenessWatcher).settle(leases.getAllValues().get(1));
+    }
+
+    @Test
+    public void testReusedSubscriptionIdEndsThePreviousConsumer() throws Exception {
+        EndpointConnectionHandler handler = connect(Map.of());
+        subscribeReplies(handler);
+        subscribeReplies(handler);
+        verify(replyConsumer, times(1)).unregister();
+    }
+
+    @Test
+    public void testConnectionKeepAliveTouchesTheSessionAtConnect() throws Exception {
+        Session session = services.sessionStore.createSession(SESSION_TIMEOUT_MS * 10);
+        services.sessionStore.put(session).toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+        long storedBefore = storedSession(session.id()).lastAccessed();
+        Thread.sleep(20);
+
+        connect(session, Map.of(EventConstants.SESSION_KEEP_ALIVE_HEADER, "CONNECTION"));
+        long deadline = System.currentTimeMillis() + 5000;
+        while (storedSession(session.id()).lastAccessed() == storedBefore && System.currentTimeMillis() < deadline) {
+            Thread.sleep(50);
+        }
+        Assertions.assertTrue(storedSession(session.id()).lastAccessed() > storedBefore, "the connect never reached the store");
+    }
+
+    @Test
+    public void testSessionDeletedFromTheStoreIsNotRecreatedByTheTouch() throws Exception {
+        Session session = services.sessionStore.createSession(SESSION_TIMEOUT_MS * 10);
+        services.sessionStore.put(session).toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+        EndpointConnectionHandler handler = connect(session, Map.of());
+        // connect() touched the session; let that write land before the delete
+        Thread.sleep(300);
+
+        // a logout deletes the session; the connection's next touch must not put it back
+        services.sessionStore.delete(session.id()).toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+        Thread.sleep(SESSION_TIMEOUT_MS / 4 + 50);
+        handler.unsubscribe("none");
+        Thread.sleep(500);
+        Assertions.assertNull(storedSession(session.id()), "the touch re-created a deleted session");
     }
 
     @Test

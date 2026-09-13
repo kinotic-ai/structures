@@ -18,7 +18,6 @@ package org.kinotic.core.internal.api.service.json;
 
 import org.springframework.core.codec.DecodingException;
 import org.springframework.core.io.buffer.DataBufferLimitException;
-import reactor.core.publisher.Flux;
 import tools.jackson.core.JacksonException;
 import tools.jackson.core.JsonParser;
 import tools.jackson.core.JsonToken;
@@ -90,18 +89,16 @@ final class JacksonTokenizer {
 		}
 	}
 
-	private Flux<TokenBuffer> endOfInput() {
-		return Flux.defer(() -> {
-			this.inputFeeder.endOfInput();
-			try {
-				List<TokenBuffer> tokens = new ArrayList<>();
-				parseTokens(tokens);
-				return Flux.fromIterable(tokens);
-			}
-			catch (JacksonException ex) {
-				throw new DecodingException("JSON decoding error: " + ex.getOriginalMessage(), ex);
-			}
-		});
+	private List<TokenBuffer> endOfInput() {
+		this.inputFeeder.endOfInput();
+		try {
+			List<TokenBuffer> tokens = new ArrayList<>();
+			parseTokens(tokens);
+			return tokens;
+		}
+		catch (JacksonException ex) {
+			throw new DecodingException("JSON decoding error: " + ex.getOriginalMessage(), ex);
+		}
 	}
 
 	private void parseTokens(List<TokenBuffer> tokens) {
@@ -195,34 +192,31 @@ final class JacksonTokenizer {
 
 
 	/**
-	 * Tokenize the given {@code Flux<byte>} into {@code Flux<TokenBuffer>}.
-	 * @param buffers the source data buffers
+	 * Tokenize the given JSON bytes into a list of {@code TokenBuffer}s, one per top-level value.
+	 * @param bytes the complete JSON document
 	 * @param objectMapper the current mapper instance
 	 * @param tokenizeArrays if {@code true} and the "top level" JSON object is
-	 * an array, each element is returned individually immediately after it is received
+	 * an array, each element is returned individually
 	 * @param maxInMemorySize maximum memory size
 	 * @return the resulting token buffers
+	 * @throws DecodingException when the bytes are not valid JSON
+	 * @throws DataBufferLimitException when a single value exceeds {@code maxInMemorySize}
 	 */
-	public static Flux<TokenBuffer> tokenize(Flux<byte[]> buffers,
+	public static List<TokenBuffer> tokenize(byte[] bytes,
 											 ObjectMapper objectMapper,
 											 boolean tokenizeArrays,
 											 int maxInMemorySize) {
-
+		JsonParser parser;
 		try {
-			JsonParser parser;
-			try {
-				parser = objectMapper.createNonBlockingByteBufferParser();
-			}
-			catch (UnsupportedOperationException ex) {
-				parser = objectMapper.createNonBlockingByteArrayParser();
-			}
-			JacksonTokenizer tokenizer =
-					new JacksonTokenizer(parser, tokenizeArrays, maxInMemorySize);
-			return buffers.concatMapIterable(tokenizer::tokenize).concatWith(tokenizer.endOfInput());
+			parser = objectMapper.createNonBlockingByteBufferParser();
 		}
-		catch (JacksonException ex) {
-			return Flux.error(ex);
+		catch (UnsupportedOperationException ex) {
+			parser = objectMapper.createNonBlockingByteArrayParser();
 		}
+		JacksonTokenizer tokenizer = new JacksonTokenizer(parser, tokenizeArrays, maxInMemorySize);
+		List<TokenBuffer> tokens = new ArrayList<>(tokenizer.tokenize(bytes));
+		tokens.addAll(tokenizer.endOfInput());
+		return tokens;
 	}
 
 }

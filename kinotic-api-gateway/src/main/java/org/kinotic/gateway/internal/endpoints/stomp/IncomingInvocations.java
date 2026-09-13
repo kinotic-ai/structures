@@ -12,6 +12,7 @@ import org.kinotic.gateway.internal.endpoints.Services;
 
 import java.util.HashMap;
 import java.util.Map;
+import java.util.UUID;
 
 /**
  * Invocations the client on this connection has sent to the cluster and is waiting on. Each one is pinned
@@ -25,6 +26,8 @@ import java.util.Map;
 public class IncomingInvocations {
 
     private final Services services;
+    // correlation ids are the client's own, so the node-wide lease key is qualified per connection
+    private final String leasePrefix = UUID.randomUUID() + ":";
     private final Map<String, EventConsumer> replySubscriptions = new HashMap<>();
     // pending invocations by correlation id; only ever touched on the connection's event loop
     private final Map<String, Metadata> invocations = new HashMap<>();
@@ -44,7 +47,11 @@ public class IncomingInvocations {
                          subscriptionHandler.handleEvent(event);
                      })
                      .exceptionHandler(subscriptionHandler::handleError);
-        replySubscriptions.put(subscriptionIdentifier, eventConsumer);
+        // a subscription id the client reuses ends the consumer it named before
+        EventConsumer previous = replySubscriptions.put(subscriptionIdentifier, eventConsumer);
+        if (previous != null) {
+            previous.unregister();
+        }
     }
 
     /**
@@ -82,7 +89,7 @@ public class IncomingInvocations {
         if (correlationId != null) {
             // the reply can arrive before the ack; computeIfPresent then does nothing
             invocations.computeIfPresent(correlationId, (_, replyMetadata) -> {
-                services.requestLivenessWatcher.watch(correlationId, nodeId, () -> fail(correlationId, destination, nodeId));
+                services.requestLivenessWatcher.watch(leasePrefix + correlationId, nodeId, () -> fail(correlationId, destination, nodeId));
                 return replyMetadata;
             });
         }
@@ -93,7 +100,7 @@ public class IncomingInvocations {
      */
     public void settle(String correlationId) {
         if (correlationId != null && invocations.remove(correlationId) != null) {
-            services.requestLivenessWatcher.settle(correlationId);
+            services.requestLivenessWatcher.settle(leasePrefix + correlationId);
         }
     }
 
@@ -101,7 +108,7 @@ public class IncomingInvocations {
      * Releases every pending invocation and unsubscribes every reply destination.
      */
     public void dispose() {
-        invocations.keySet().forEach(services.requestLivenessWatcher::settle);
+        invocations.keySet().forEach(correlationId -> services.requestLivenessWatcher.settle(leasePrefix + correlationId));
         invocations.clear();
         replySubscriptions.values().forEach(EventConsumer::unregister);
         replySubscriptions.clear();

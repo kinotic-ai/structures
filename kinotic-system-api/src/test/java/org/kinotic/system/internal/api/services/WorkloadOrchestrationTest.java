@@ -1,6 +1,12 @@
 package org.kinotic.system.internal.api.services;
 
 import io.vertx.core.Future;
+import io.vertx.core.Vertx;
+import org.kinotic.core.api.event.CRI;
+import org.mockito.ArgumentCaptor;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.mockito.Mockito.when;
 import static org.mockito.Mockito.mock;
 import static org.mockito.ArgumentMatchers.any;
@@ -11,12 +17,14 @@ import org.kinotic.core.api.exceptions.RpcServiceUnavailableException;
 import org.kinotic.core.api.exceptions.RpcMissingServiceException;
 import org.kinotic.core.api.event.ListenerStatus;
 import org.kinotic.core.api.event.EventBusService;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.kinotic.system.api.config.KinoticSystemApiProperties;
 import org.kinotic.system.api.model.workload.VmNode;
 import org.kinotic.system.api.model.workload.VmNodeStatus;
 import org.kinotic.system.api.model.workload.VmNodeStatusType;
+import org.kinotic.system.api.workload.VmNodeRegistration;
 import org.kinotic.management.api.model.workload.Workload;
 import org.kinotic.management.api.model.workload.WorkloadStatus;
 import org.kinotic.system.api.workload.WorkloadStatusReport;
@@ -44,6 +52,7 @@ public class WorkloadOrchestrationTest {
     private StubVmNodeService nodes;
     private StubVmManagerProxy vmManager;
     private EventBusService eventBus;
+    private Vertx vertx;
     private KinoticSystemApiProperties properties;
     private DefaultVmNodeOrchestrationService nodeOrchestration;
     private DefaultWorkloadOrchestrationService orchestration;
@@ -53,29 +62,95 @@ public class WorkloadOrchestrationTest {
         workloads = new StubWorkloadService();
         nodes = new StubVmNodeService();
         nodes.availableNode = new VmNode(NODE_ID, "node-1", "host-1");
+        nodes.saveSync(nodes.availableNode);
         vmManager = new StubVmManagerProxy();
         // the node's vm-manager registration, as the cluster reports it: absent unless a test says otherwise
         eventBus = mock(EventBusService.class);
         when(eventBus.monitorListenerStatus(any())).thenReturn(Flux.just(ListenerStatus.INACTIVE));
         properties = new KinoticSystemApiProperties();
-        nodeOrchestration = new DefaultVmNodeOrchestrationService(properties, nodes, workloads, eventBus);
+        vertx = Vertx.vertx();
+        nodeOrchestration = new DefaultVmNodeOrchestrationService(properties, nodes, workloads, eventBus, vertx);
         orchestration = new DefaultWorkloadOrchestrationService(nodeOrchestration, vmManager,
                                                                 nodes, workloads);
     }
 
+    @AfterEach
+    void tearDown() throws Exception {
+        await(vertx.close());
+    }
+
     @Test
     public void unreachableVmManagerMarksItsNodeUnreachableAtOnce() throws Exception {
-        nodes.saveSync(nodes.availableNode);
         vmManager.failStartWith = new RpcMissingServiceException("no vm-manager registered for node-1");
+
+        Exception failure = assertThrows(Exception.class, () -> await(orchestration.deployWorkload(newWorkload())));
+        assertInstanceOf(RpcMissingServiceException.class, failure.getCause());
+
+        // the registration checked is the vm-manager scoped to this node, the address the proxy sends to
+        ArgumentCaptor<CRI> watched = ArgumentCaptor.forClass(CRI.class);
+        verify(eventBus).monitorListenerStatus(watched.capture());
+        assertEquals(NODE_ID, watched.getValue().scope());
+        assertTrue(watched.getValue().raw().contains("VmManager"), watched.getValue().raw());
+        assertEquals(VmNodeStatusType.UNREACHABLE, awaitNodeStatus(VmNodeStatusType.UNREACHABLE));
+    }
+
+    @Test
+    public void markingUnreachableLeavesLastSeenAlone() throws Exception {
+        // The placement read (availableNode) predates this heartbeat, so a full save of it would
+        // put the older lastSeen back
+        Date heartbeatAt = await(nodeOrchestration.heartbeat(NODE_ID, List.of())).getLastSeen();
+        vmManager.failStartWith = new RpcMissingServiceException("gone");
 
         assertThrows(Exception.class, () -> await(orchestration.deployWorkload(newWorkload())));
 
-        assertEquals(VmNodeStatusType.UNREACHABLE, nodes.saved.get(NODE_ID).getStatus().getType());
+        assertEquals(VmNodeStatusType.UNREACHABLE, awaitNodeStatus(VmNodeStatusType.UNREACHABLE));
+        assertEquals(heartbeatAt, nodes.saved.get(NODE_ID).getLastSeen());
+    }
+
+    @Test
+    public void registeringANewNodeStampsLastSeen() throws Exception {
+        Date before = new Date();
+
+        await(nodeOrchestration.registerNode(new VmNodeRegistration("node-2", "node-2", "host-2")));
+
+        assertFalse(nodes.saved.get("node-2").getLastSeen().before(before));
+    }
+
+    @Test
+    public void reRegisteringANodeStampsLastSeen() throws Exception {
+        VmNode node = nodes.saved.get(NODE_ID);
+        node.setLastSeen(new Date(System.currentTimeMillis() - 10_000));
+        nodes.saveSync(node);
+        Date before = new Date();
+
+        await(nodeOrchestration.registerNode(new VmNodeRegistration(NODE_ID, "node-1", "host-1")));
+
+        assertFalse(nodes.saved.get(NODE_ID).getLastSeen().before(before));
+    }
+
+    @Test
+    public void ordinaryStartFailureDoesNotVerifyTheNode() throws Exception {
+        vmManager.failStartWith = new RuntimeException("node exploded");
+
+        assertThrows(Exception.class, () -> await(orchestration.deployWorkload(newWorkload())));
+
+        verify(eventBus, never()).monitorListenerStatus(any());
+        assertEquals(VmNodeStatusType.ONLINE, nodes.saved.get(NODE_ID).getStatus().getType());
+    }
+
+    @Test
+    public void heartbeatBringsAnUnreachableNodeBackOnline() throws Exception {
+        vmManager.failStartWith = new RpcMissingServiceException("gone");
+        assertThrows(Exception.class, () -> await(orchestration.deployWorkload(newWorkload())));
+        assertEquals(VmNodeStatusType.UNREACHABLE, awaitNodeStatus(VmNodeStatusType.UNREACHABLE));
+
+        await(nodeOrchestration.heartbeat(NODE_ID, List.of()));
+
+        assertEquals(VmNodeStatusType.ONLINE, nodes.saved.get(NODE_ID).getStatus().getType());
     }
 
     @Test
     public void reachableVmManagerKeepsItsNodeOnlineWhenACallFails() throws Exception {
-        nodes.saveSync(nodes.availableNode);
         when(eventBus.monitorListenerStatus(any())).thenReturn(Flux.just(ListenerStatus.ACTIVE));
         vmManager.failStartWith = new RpcServiceUnavailableException("the gateway serving it left mid-call");
 
@@ -96,11 +171,44 @@ public class WorkloadOrchestrationTest {
 
         nodeOrchestration.init();
         try {
-            long deadline = System.currentTimeMillis() + 10_000;
-            while (nodes.saved.get(NODE_ID).getStatus().getType() != VmNodeStatusType.OFFLINE && System.currentTimeMillis() < deadline) {
-                Thread.sleep(100);
-            }
-            assertEquals(VmNodeStatusType.OFFLINE, nodes.saved.get(NODE_ID).getStatus().getType());
+            assertEquals(VmNodeStatusType.OFFLINE, awaitNodeStatus(VmNodeStatusType.OFFLINE));
+            assertEquals(WorkloadStatus.FAILED, workloads.saved.get(deployed.getId()).getStatus());
+        } finally {
+            nodeOrchestration.destroy();
+        }
+    }
+
+    @Test
+    public void silentUnreachableNodeGoesOffline() throws Exception {
+        properties.getSystemApi().getVmNode().setHealthCheckIntervalSeconds(1);
+        properties.getSystemApi().getVmNode().setHeartbeatTimeoutSeconds(1);
+        VmNode node = nodes.saved.get(NODE_ID);
+        node.setStatus(new VmNodeStatus(VmNodeStatusType.UNREACHABLE, null));
+        node.setLastSeen(new Date(System.currentTimeMillis() - 10_000));
+        nodes.saveSync(node);
+
+        nodeOrchestration.init();
+        try {
+            assertEquals(VmNodeStatusType.OFFLINE, awaitNodeStatus(VmNodeStatusType.OFFLINE));
+        } finally {
+            nodeOrchestration.destroy();
+        }
+    }
+
+    @Test
+    public void silentNodeFailsItsStoppingWorkload() throws Exception {
+        properties.getSystemApi().getVmNode().setHealthCheckIntervalSeconds(1);
+        properties.getSystemApi().getVmNode().setHeartbeatTimeoutSeconds(1);
+        // a stop whose reply never came back from the node leaves the record STOPPING
+        Workload deployed = await(orchestration.deployWorkload(newWorkload()));
+        workloads.saved.get(deployed.getId()).setStatus(WorkloadStatus.STOPPING);
+        VmNode node = nodes.saved.get(NODE_ID);
+        node.setLastSeen(new Date(System.currentTimeMillis() - 10_000));
+        nodes.saveSync(node);
+
+        nodeOrchestration.init();
+        try {
+            assertEquals(VmNodeStatusType.OFFLINE, awaitNodeStatus(VmNodeStatusType.OFFLINE));
             assertEquals(WorkloadStatus.FAILED, workloads.saved.get(deployed.getId()).getStatus());
         } finally {
             nodeOrchestration.destroy();
@@ -271,6 +379,19 @@ public class WorkloadOrchestrationTest {
 
     private static <T> T await(Future<T> future) throws Exception {
         return future.toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+    }
+
+    /**
+     * Returns the stored status type of {@link #NODE_ID} once it is {@code expected}, or whatever it is
+     * when the wait runs out. Status writes made by verifyNode's continuation land on the Vertx
+     * context and by the reaper on its scheduler thread, after the call the test awaited returned.
+     */
+    private VmNodeStatusType awaitNodeStatus(VmNodeStatusType expected) throws Exception {
+        long deadline = System.currentTimeMillis() + 10_000;
+        while (nodes.saved.get(NODE_ID).getStatus().getType() != expected && System.currentTimeMillis() < deadline) {
+            Thread.sleep(50);
+        }
+        return nodes.saved.get(NODE_ID).getStatus().getType();
     }
 
     private static Workload newWorkload() {

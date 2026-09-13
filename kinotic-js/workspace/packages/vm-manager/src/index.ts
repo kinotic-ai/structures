@@ -56,6 +56,11 @@ const RECONNECT_MAX_DELAY_MS = 120000
 const RECONNECT_MIN_JITTER_MS = 1000
 const RECONNECT_MAX_JITTER_MS = 5000
 
+// How long a graceful disconnect may take before the process exits with the socket still open. A
+// half-open socket answers neither the DISCONNECT frame nor the close, so a graceful disconnect on
+// one lasts the heartbeat timeout plus the WebSocket close timeout; the exit closes it instead.
+const DISCONNECT_TIMEOUT_MS = 5000
+
 // The node runs whichever provider it is configured for and nothing else, so a provider it
 // cannot construct is a fatal misconfiguration rather than a capability to omit
 function createProvider(reportStatus: (workload: Workload) => void): IVmProvider {
@@ -236,7 +241,7 @@ async function shutdown() {
         clearTimeout(heartbeatTimer)
     }
     await alloyManager?.stop()
-    await Kinotic.disconnect()
+    await Promise.race([Kinotic.disconnect(), Bun.sleep(DISCONNECT_TIMEOUT_MS)])
     process.exit(0)
 }
 

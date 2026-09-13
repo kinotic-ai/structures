@@ -148,10 +148,10 @@ public class DefaultRpcServiceProxyHandle<T> implements RpcServiceProxyHandle<T>
 
                     String correlationId = event.metadata().get(EventConstants.CORRELATION_ID_HEADER);
                     if(correlationId != null){
-                        if(responseMap.containsKey(correlationId)){
+                        // one lookup: a cancel or a lost node can remove the entry from another context
+                        RpcReturnValueHandler handler = responseMap.get(correlationId);
+                        if(handler != null){
                             try {
-                                // provide message to handler for processing
-                                RpcReturnValueHandler handler = responseMap.get(correlationId);
                                 if(handler.processResponse(event)){
                                     settle(correlationId);
                                 }
@@ -210,11 +210,13 @@ public class DefaultRpcServiceProxyHandle<T> implements RpcServiceProxyHandle<T>
         if(released.compareAndSet(false,true)){
             replyEventConsumer.unregister();
 
-            responseMap.forEach((correlationId, returnValueHandler) -> {
-                requestLivenessWatcher.settle(correlationId);
-                returnValueHandler.cancel(serviceClass.getSimpleName() + " released. No further responses will be processed");
-            });
-            responseMap.clear();
+            for(String correlationId : responseMap.keySet()){
+                RpcReturnValueHandler returnValueHandler = responseMap.remove(correlationId);
+                if(returnValueHandler != null){
+                    requestLivenessWatcher.settle(correlationId);
+                    returnValueHandler.cancel(serviceClass.getSimpleName() + " released. No further responses will be processed");
+                }
+            }
             recentlyReaped.clear();
         }
     }
@@ -222,7 +224,7 @@ public class DefaultRpcServiceProxyHandle<T> implements RpcServiceProxyHandle<T>
     /**
      * Handles a reply for a correlationId this proxy no longer tracks by cancelling the orphaned stream.
      * The server can't detect such an abandoned stream itself, since all of this proxy's requests share one
-     * reply destination, so we route a cancel to the origin CRI the server sends on stream replies.
+     * reply destination, so a cancel goes to the origin CRI the server sends on stream replies.
      */
     private void reapOrphanedStream(Event<byte[]> event, String correlationId){
         String originCri = event.metadata().get(EventConstants.ORIGIN_CRI_HEADER);
@@ -235,11 +237,17 @@ public class DefaultRpcServiceProxyHandle<T> implements RpcServiceProxyHandle<T>
         if(recentlyReaped.add(correlationId)){
             vertx.setTimer(REAP_DEBOUNCE_MS, _ -> recentlyReaped.remove(correlationId));
 
-            Metadata metadata = Metadata.create();
-            metadata.put(EventConstants.CONTROL_HEADER, EventConstants.CONTROL_VALUE_CANCEL);
-            metadata.put(EventConstants.CORRELATION_ID_HEADER, correlationId);
-            eventBusService.send(Event.create(CRI.create(originCri), metadata, null));
+            sendCancel(CRI.create(originCri), correlationId);
         }
+    }
+
+    // Published, not sent: the instance producing the stream is whichever one round-robin gave the request,
+    // so every instance of the service gets the cancel and the ones without the stream ignore it
+    private void sendCancel(CRI serviceCri, String correlationId){
+        Metadata metadata = Metadata.create();
+        metadata.put(EventConstants.CONTROL_HEADER, EventConstants.CONTROL_VALUE_CANCEL);
+        metadata.put(EventConstants.CORRELATION_ID_HEADER, correlationId);
+        eventBusService.publish(Event.create(serviceCri, metadata, null));
     }
 
     /**
@@ -247,8 +255,10 @@ public class DefaultRpcServiceProxyHandle<T> implements RpcServiceProxyHandle<T>
      * that acknowledged it and no longer receives replies.
      */
     private void settle(String correlationId){
-        requestLivenessWatcher.settle(correlationId);
+        // the entry goes first: once it is gone the ack's computeIfPresent can no longer pin, so the lease
+        // released next is the last one this request can have
         responseMap.remove(correlationId);
+        requestLivenessWatcher.settle(correlationId);
     }
 
     @Override
@@ -289,6 +299,12 @@ public class DefaultRpcServiceProxyHandle<T> implements RpcServiceProxyHandle<T>
             RpcReturnValueHandler handler = new TracingRpcReturnValueHandler(
                     rpcReturnValueHandlerFactory.createReturnValueHandler(method, args), span);
             responseMap.put(correlationId, handler);
+            // release() may have scanned the map between the guard above and this put
+            if(released.get()){
+                responseMap.remove(correlationId);
+                handler.cancel(serviceClass.getSimpleName() + " released. No further responses will be processed");
+                throw new IllegalStateException("RpcServiceProxyHandle has already been released. No service method can be called after release.");
+            }
 
             // Create Event to be sent to remote end to cause service invocation
             Metadata metadata = Metadata.create();
@@ -350,16 +366,8 @@ public class DefaultRpcServiceProxyHandle<T> implements RpcServiceProxyHandle<T>
                 @Override
                 public void cancelRequest() {
                     if(handler.isMultiValue()) {
-                        // Now publish message for remote control
-                        Metadata metadata = Metadata.create();
-                        metadata.put(EventConstants.CONTROL_HEADER, EventConstants.CONTROL_VALUE_CANCEL);
-                        metadata.put(EventConstants.CORRELATION_ID_HEADER, correlationId);
-
-                        // Send data to remote end for control request
-                        eventBusService.sendWithAck(Event.create(requestCri,
-                                                                 metadata,
-                                                                 null))
-                                       .onComplete(ar -> settle(correlationId));
+                        sendCancel(requestCri, correlationId);
+                        settle(correlationId);
                     } else {
                         throw new IllegalStateException("Cancel is not supported if RpcReturnValueHandler.isMultiValue returns false");
                     }
@@ -377,12 +385,7 @@ public class DefaultRpcServiceProxyHandle<T> implements RpcServiceProxyHandle<T>
     private void failLost(String correlationId, CRI requestCri, String nodeId){
         RpcReturnValueHandler lost = responseMap.remove(correlationId);
         if(lost != null){
-            try {
-                lost.processError(new RpcServiceUnavailableException("Node " + nodeId + " left the cluster while serving the request to " + requestCri.raw()));
-            } catch (IllegalStateException e) {
-                // the reply completed the handler between the removal above and this signal
-                log.debug("Request {} to {} settled before its node loss was signalled", correlationId, requestCri.raw());
-            }
+            lost.processError(new RpcServiceUnavailableException("Node " + nodeId + " left the cluster while serving the request to " + requestCri.raw()));
         }
     }
 

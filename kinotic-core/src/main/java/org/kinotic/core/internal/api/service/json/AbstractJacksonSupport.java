@@ -20,7 +20,6 @@ import org.springframework.core.codec.CodecException;
 import org.springframework.core.codec.DecodingException;
 import org.springframework.core.codec.EncodingException;
 import org.springframework.util.MimeTypeUtils;
-import reactor.core.publisher.Flux;
 import tools.jackson.core.JacksonException;
 import tools.jackson.databind.JavaType;
 import tools.jackson.databind.ObjectReader;
@@ -103,20 +102,13 @@ public abstract class AbstractJacksonSupport {
         Validate.notNull(event, "event must not be null");
         Validate.notNull(parameters, "parameters must not be null");
 
-        // TODO: remove the use of the Spring Tokenizer since I have found out about the performance issues with reactor
-        // Should we use the JacksonTokenizer borrowed from spring? We are not really taking advantage of the claimed non blocking or the Flux themselves
-        // I really don't see a way to do that anyhow since all Arguments at least for the invoker must be available upfront.
-        // A return value could be parsed and streamed but that would require more machinery.
-        // And we would want to plum that all the way to the caller.
-        List<TokenBuffer> tokens = JacksonTokenizer.tokenize(Flux.just(event.data()),
+        List<TokenBuffer> tokens = JacksonTokenizer.tokenize(event.data(),
                                                              jsonMapper,
                                                              dataInArray,
-                                                             kinoticProperties.getMaxEventPayloadSize())
-                                                   .collectList()
-                                                   .block();
+                                                             kinoticProperties.getMaxEventPayloadSize());
 
         List<Object> ret = new LinkedList<>();
-        int tokenCount = (tokens != null) ? tokens.size() : 0;
+        int tokenCount = tokens.size();
 
         // Count the number of parameters that come from JSON tokens (i.e. not Participant)
         int jsonParamCount = 0;

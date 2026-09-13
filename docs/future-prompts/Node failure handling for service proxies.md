@@ -1,7 +1,7 @@
 # Node failure handling for service proxies — phase plan
 
 Plan of record for making a proxy call fail when the node serving it dies, instead of hanging
-forever. Phase 1 landed in PR #476; Phase 2 in #540; Phase 3 in #544; Phase 4 is PR #545; Phase 5 is PR #546, based on #545; Phase 6 in #547; Phases 7 and 8 were built as #548 and #549 and dropped, see their section; the fail-on-disconnect rule that replaces them is PR #551; Phase 9 is PR #552, based on #551 (#550 was closed with the dropped Phase 8 base); the wrap-up is PR #553, based on #552; TS service streaming with cancel is PR #554, based on #553. Everything below was re-validated against `develop` at `3adf17d`
+forever. Phase 1 landed in PR #476; Phase 2 in #540; Phase 3 in #544; Phase 4 is PR #545; Phase 5 is PR #546, based on #545; Phase 6 in #547; Phases 7 and 8 were built as #548 and #549 and dropped, see their section; the fail-on-disconnect rule that replaces them is PR #551; Phase 9 is PR #552, based on #551 (#550 was closed with the dropped Phase 8 base); the wrap-up is PR #553, based on #552; TS service streaming with cancel is PR #554, based on #553; the review fixes are PR #558. Everything below was re-validated against `develop` at `3adf17d`
 (2026-09-08); the adjustments that pass produced are folded in, and the phase numbering below
 supersedes the earlier chat numbering (mapping at the end).
 
@@ -442,6 +442,79 @@ Still open, and outside this repository's harness:
   one hop further.
 - An end-to-end run against a cluster: a Java caller and a UI caller each mid-call while the serving
   node is killed, and a UI mid-call while its gateway node is killed.
+
+## Review fixes (after the merges)
+
+A four-way adversarial review of everything the series landed, one reviewer per area, found the
+defects below; each was traced in the code before it was fixed. All are on one branch on top of the
+merged stack.
+
+- Every TS `invokeStream` ended with a trailing `null`: stompjs yields an empty array, never an
+  absent body, so a stream's bodiless completion reached `EventBus` with data present and was emitted
+  as a value. Since Phase 1. An empty body is now no body where frames become events.
+- A TS stream killed its own connection on its second value: the reply grant was one send per
+  delivered invocation, consumed by the first reply, and the zone rules refuse `reply://`. A reply to
+  a pending invocation's own destination is allowed while it is pending.
+- A lease could fall out of the watcher's node index: `watch` added the id to a set fetched with
+  `computeIfAbsent`, outside the lock, and a concurrent `settle` emptying that set dropped it. The add
+  runs inside `compute`.
+- Reply-consumer collision on reconnect: the reply discriminator was per client instance, so a
+  reconnect within the heartbeat window shared its reply address with the previous socket's consumer
+  and `send` round-robined replies into the dead socket. Minted per connection.
+- A request during a pending `connect()` cached the reply subscription on a null or stale address,
+  which the vm-manager's reconnect loop hit through its heartbeat. `requestStream` requires a
+  connection and an address; `connect()` resets the cache when the address changed.
+- The session touch put a session back that a logout had deleted, because the clustered store only
+  checks versions on an existing entry. The touch reads first and never re-creates.
+- `DefaultRpcServiceProxyHandle.settle()` released the lease before the map entry, so a reply that beat
+  the ack leaked a lease; the reply handler's `containsKey` then `get` could NPE and release the proxy.
+- `SingleValueSubscriber.onNext` rethrowing leaked the in-flight count, so `stop()` waited the full
+  drain; an invocation queued for the worker pool was not counted until it ran.
+- `beforeSave` stamped `lastSeen` on every `VmNode` save, so marking a node UNREACHABLE restarted its
+  reaper clock; only a heartbeat or registration stamps it. `verifyNode` bridged a Mono through a
+  context-less Promise.
+- TS supervisor: a value the converter cannot serialise, an unknown control, and an error reply with
+  no reply-to each became an uncaught exception or a running stream; `connectionLost` fired per failed
+  reconnect attempt; `disconnect()` waited behind a `connect()` that could never settle.
+- A NONE keep-alive connection deleted a login session it had not created; `disconnected()` duplicated
+  `closed()`; membership snapshots could emit out of order.
+
+A second pass took the TS connection layer and the Java supervisor on their own, with the bar of no
+known defect.
+
+- `StompConnectionManager` is reworked around a `StompActivation` per `activate()` call, which owns
+  the listeners, the pending reject, a socket produced for stompjs, and the attempt stompjs is
+  awaiting. `deactivate()` ends only the activation it took, waits for that attempt before the next
+  activation may start, and reports an open connection's end once. A fatal raised by an ended
+  activation's attempt or listener is not published; a bad CONNECTED frame rejects the connect with
+  its own reason; a connect queued behind a `disconnect()` never starts; `activate()` rejects with
+  `Error`s; the attempt budget is granted again for each connection's reconnects. A fake STOMP server
+  behind the socket factory drives these in `ConnectionLifecycle.test.ts`.
+- `ServiceInvocationSupervisor`: a stream whose caller's reply listener goes INACTIVE, whose listener
+  monitor ends, or whose service stops after the drain began ends with an error reply instead of a
+  silent cancel; `fail()` sends that reply once whichever path gets there first; a request reusing a
+  live stream's correlation id is answered with an error instead of dropped with its span open; an
+  unknown control cancels the source it answers with an error; a single-value reply that cannot be
+  sent is answered the same way whether it came from `onNext` or an empty completion.
+- `ServiceInvocationSupervisor` no longer dispatches through `vertx.executeBlocking`: an invocation
+  runs on its delivery context, so the synchronous slice of one service's invocations is no longer
+  serialized on one ordered worker and no worker hop or shared pool sits in the request path. A slow
+  handler hands off inside itself, the rule the platform docs now state. The stream registry uses
+  `putIfAbsent` and removes inline, and the in-flight count is a pair of plain methods. The argument
+  tokenizer is a synchronous call with no `block()` on the event loop.
+
+The second review's remaining findings (`Node failure review round two.md`) are fixed on the same
+branch: a cancel is published to every instance of the service, so the one producing the stream gets
+it whichever instance round-robin gave the request; a reply the gateway connection does not owe is
+dropped instead of ending the connection, and a TS service drops results for invocations of a lost
+connection; `VertxFutureRpcReturnValueHandler` completes idempotently; lease keys are qualified per
+connection; a CONNECTION keep-alive touches the session at connect and every quarter of the timeout;
+a control event earns no reply grant; a reused subscription id ends its predecessor; a requester whose
+listener is gone is answered as well as cancelled; VmNode status and allocation are partial updates so
+only a heartbeat writes `lastSeen`, and the reaper takes STOPPING workloads with the rest; the TS
+supervisor stops a synchronous stream on its first unsendable value, answers with the
+`{exceptionName, exceptionClass, errorMessage}` shape every runtime reads, and the vm-manager bounds
+its graceful disconnect on shutdown.
 
 ## Numbering
 

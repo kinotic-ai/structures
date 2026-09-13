@@ -68,15 +68,16 @@ public class DefaultWorkloadOrchestrationService implements WorkloadOrchestratio
                     workload.setNodeId(node.getId());
                     workload.setStatus(WorkloadStatus.STARTING);
 
-                    // Persist the workload and update node resource allocation
+                    // Persist the workload and update node resource allocation. Only the allocation is
+                    // written, so a heartbeat that landed after the placement read keeps its lastSeen.
                     return persistRedacted(workload)
-                            .compose(savedWorkload -> {
-                                node.setAvailableCpus(node.getAvailableCpus() - savedWorkload.getVcpus());
-                                node.setAvailableMemoryMb(node.getAvailableMemoryMb() - savedWorkload.getMemoryMb());
-                                node.setAvailableDiskMb(node.getAvailableDiskMb() - savedWorkload.getDiskSizeMb());
-                                return vmNodeService.saveSync(node)
-                                        .map(savedWorkload);
-                            })
+                            .compose(savedWorkload ->
+                                vmNodeService.updateAllocationSync(node.getId(),
+                                                                   node.getAvailableCpus() - savedWorkload.getVcpus(),
+                                                                   node.getAvailableMemoryMb() - savedWorkload.getMemoryMb(),
+                                                                   node.getAvailableDiskMb() - savedWorkload.getDiskSizeMb())
+                                        .map(savedWorkload)
+                            )
                             .compose(savedWorkload ->
                                 // Dispatch to the VmManager on the selected node. For a
                                 // non-detached workload the reply arrives once the run ends.
@@ -162,22 +163,24 @@ public class DefaultWorkloadOrchestrationService implements WorkloadOrchestratio
                     // Dispatch destroy to the VmManager on the workload's node
                     return verifyingNodeOnFailure(workload.getNodeId(), vmManagerProxy.destroyWorkload(workload.getNodeId(), workloadId))
                             .compose(v ->
-                                // Free allocated resources on the node
+                                // Free allocated resources on the node. Only the allocation is written, so a
+                                // heartbeat that landed after the read keeps its lastSeen.
                                 vmNodeService.findById(workload.getNodeId())
                                         .compose(node -> {
-                                            Future<VmNode> ret;
+                                            Future<Void> ret;
                                             if (node != null) {
-                                                node.setAvailableCpus(Math.min(node.getTotalCpus(), node.getAvailableCpus() + workload.getVcpus()));
-                                                node.setAvailableMemoryMb(Math.min(node.getTotalMemoryMb(), node.getAvailableMemoryMb() + workload.getMemoryMb()));
-                                                node.setAvailableDiskMb(Math.min(node.getTotalDiskMb(), node.getAvailableDiskMb() + workload.getDiskSizeMb()));
-                                                ret = vmNodeService.saveSync(node);
+                                                ret = vmNodeService.updateAllocationSync(
+                                                        node.getId(),
+                                                        Math.min(node.getTotalCpus(), node.getAvailableCpus() + workload.getVcpus()),
+                                                        Math.min(node.getTotalMemoryMb(), node.getAvailableMemoryMb() + workload.getMemoryMb()),
+                                                        Math.min(node.getTotalDiskMb(), node.getAvailableDiskMb() + workload.getDiskSizeMb()));
                                             } else {
-                                                ret = Future.succeededFuture(node);
+                                                ret = Future.succeededFuture();
                                             }
                                             return ret;
                                         })
                             )
-                            .compose(node -> workloadService.deleteById(workloadId));
+                            .compose(v -> workloadService.deleteById(workloadId));
                 });
     }
 

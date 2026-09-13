@@ -15,6 +15,7 @@ import org.junit.jupiter.api.Test;
 import org.kinotic.core.api.RpcServiceProxyHandle;
 import org.kinotic.core.api.ServiceRegistry;
 import org.kinotic.core.api.event.Event;
+import org.kinotic.core.api.event.EventConstants;
 import org.kinotic.core.api.exceptions.RpcServiceUnavailableException;
 import org.kinotic.core.api.security.Participant;
 import org.kinotic.core.api.security.SecurityContext;
@@ -28,6 +29,7 @@ import org.kinotic.core.internal.utils.MetaUtil;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.test.context.ActiveProfiles;
+import reactor.core.Disposable;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.publisher.Sinks;
@@ -117,6 +119,27 @@ public class RpcLivenessTests {
     }
 
     @Test
+    public void testLeaseSurvivesASiblingSettlingOnTheSameNode() throws Exception {
+        KinoticIgniteClusterManager secondClusterManager = startSecondNode();
+        String nodeId = secondClusterManager.getNodeId();
+        CompletableFuture<Void> lost = new CompletableFuture<>();
+        withParticipant(() -> {
+            requestLivenessWatcher.watch("first", nodeId, () -> {});
+            requestLivenessWatcher.watch("second", nodeId, () -> lost.complete(null));
+            return null;
+        });
+        awaitPendingCount(2);
+
+        // settling the first must not take the node's index entry away from the second
+        requestLivenessWatcher.settle("first");
+        awaitPendingCount(1);
+        stopSecondNode();
+
+        lost.get(1, TimeUnit.MINUTES);
+        awaitPendingCount(0);
+    }
+
+    @Test
     public void testInFlightCallRepliesAfterUnregister() throws Exception {
         GatedDrainTestService service = new GatedDrainTestService();
         ServiceIdentifier serviceIdentifier = register(service);
@@ -152,6 +175,36 @@ public class RpcLivenessTests {
                         .verify(Duration.ofSeconds(30));
         } finally {
             handle.release();
+        }
+    }
+
+    @Test
+    public void testCancelReachesTheInstanceProducingTheStream() throws Exception {
+        GatedDrainTestService service = new GatedDrainTestService();
+        ServiceIdentifier serviceIdentifier = register(service);
+        RpcServiceProxyHandle<DrainTestService> handle = serviceRegistry.serviceProxy(serviceIdentifier, DrainTestService.class);
+        try {
+            Flux<String> stream = withParticipant(() -> handle.getService().streamUntilStopped());
+            CountDownLatch firstValue = new CountDownLatch(1);
+            Disposable subscription = stream.subscribe(_ -> firstValue.countDown());
+            Assertions.assertTrue(firstValue.await(10, TimeUnit.SECONDS), "the stream never produced");
+
+            // a second instance of the service, joining after the stream started: a cancel sent to the shared
+            // address could land here instead of on the instance producing the stream
+            CountDownLatch cancelSeenBySibling = new CountDownLatch(1);
+            vertx.eventBus().<Event<byte[]>>consumer(serviceIdentifier.cri().baseResource(), message -> {
+                     if(EventConstants.CONTROL_VALUE_CANCEL.equals(message.body().metadata().get(EventConstants.CONTROL_HEADER))){
+                         cancelSeenBySibling.countDown();
+                     }
+                 })
+                 .completion().toCompletionStage().toCompletableFuture().get(10, TimeUnit.SECONDS);
+
+            subscription.dispose();
+            Assertions.assertTrue(cancelSeenBySibling.await(10, TimeUnit.SECONDS), "the sibling instance never saw the cancel");
+            Assertions.assertTrue(service.streamCancelled.await(10, TimeUnit.SECONDS), "the producing instance never saw the cancel");
+        } finally {
+            handle.release();
+            serviceRegistry.unregister(serviceIdentifier).toCompletionStage().toCompletableFuture().get(10, TimeUnit.SECONDS);
         }
     }
 
@@ -245,6 +298,7 @@ public class RpcLivenessTests {
     private static class GatedDrainTestService implements DrainTestService {
         final CompletableFuture<String> gate = new CompletableFuture<>();
         final CountDownLatch gateReached = new CountDownLatch(1);
+        final CountDownLatch streamCancelled = new CountDownLatch(1);
 
         @Override
         public Mono<String> awaitGate() {
@@ -256,7 +310,7 @@ public class RpcLivenessTests {
         public Flux<String> streamUntilStopped() {
             Sinks.Many<String> sink = Sinks.many().unicast().onBackpressureBuffer();
             sink.tryEmitNext("first");
-            return sink.asFlux();
+            return sink.asFlux().doOnCancel(streamCancelled::countDown);
         }
     }
 }

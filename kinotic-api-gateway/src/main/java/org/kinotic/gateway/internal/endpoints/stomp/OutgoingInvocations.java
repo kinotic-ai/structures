@@ -40,8 +40,10 @@ public class OutgoingInvocations {
      * names. An invocation without a correlation id or reply-to expects no reply and is not recorded.
      * @param event the invocation
      * @param subscriptionHandler the subscription it is delivered through; a cancel goes back through the same one
+     * @return true when the invocation is now pending, so its replies are allowed until the terminal one
      */
-    public void deliver(Event<byte[]> event, StompSubscriptionHandler subscriptionHandler) {
+    public boolean deliver(Event<byte[]> event, StompSubscriptionHandler subscriptionHandler) {
+        boolean ret = false;
         Metadata metadata = event.metadata();
         String correlationId = metadata.get(EventConstants.CORRELATION_ID_HEADER);
         if (correlationId != null) {
@@ -49,14 +51,26 @@ public class OutgoingInvocations {
             if (control == null) {
                 if (metadata.contains(EventConstants.REPLY_TO_HEADER)) {
                     invocations.put(correlationId, new OutgoingInvocation(event.cri(),
-                                                                                       EventUtil.replyMetadataOf(metadata),
-                                                                                       subscriptionHandler,
-                                                                                       services.vertx.getOrCreateContext()));
+                                                                          EventUtil.replyMetadataOf(metadata),
+                                                                          subscriptionHandler,
+                                                                          services.vertx.getOrCreateContext()));
+                    ret = true;
                 }
             } else if (EventConstants.CONTROL_VALUE_CANCEL.equals(control)) {
                 forget(correlationId);
             }
         }
+        return ret;
+    }
+
+    /**
+     * @return true when the reply answers a pending invocation and is addressed to that invocation's
+     * reply destination
+     */
+    public boolean owesReply(Event<byte[]> reply) {
+        OutgoingInvocation invocation = invocations.get(reply.metadata().get(EventConstants.CORRELATION_ID_HEADER));
+        return invocation != null
+                && reply.cri().raw().equals(CRI.create(invocation.replyMetadata().get(EventConstants.REPLY_TO_HEADER)).raw());
     }
 
     /**
@@ -109,7 +123,9 @@ public class OutgoingInvocations {
                                   throwable -> log.warn("Requester watch for invocation {} failed", correlationId, throwable));
     }
 
-    // the requester is gone: forget the invocation and tell the client to stop the stream
+    // Nothing listens on the requester's reply destination: forget the invocation and tell the client to stop
+    // the stream. The requester is answered too, so one whose registration this node had not seen yet gets
+    // the error instead of silence; a requester that is gone drops it with the rest.
     private void cancel(String correlationId) {
         OutgoingInvocation invocation = invocations.get(correlationId);
         if (invocation != null) {
@@ -117,6 +133,13 @@ public class OutgoingInvocations {
             Metadata metadata = Metadata.create(Map.of(EventConstants.CONTROL_HEADER, EventConstants.CONTROL_VALUE_CANCEL,
                                                        EventConstants.CORRELATION_ID_HEADER, correlationId));
             invocation.subscriptionHandler().handleEvent(Event.create(invocation.cri(), metadata, null));
+            RpcServiceUnavailableException cause = new RpcServiceUnavailableException(
+                    "No listener on the reply destination of the stream");
+            try {
+                services.eventBusService.send(services.exceptionConverter.convert(invocation.replyMetadata(), cause));
+            } catch (Exception e) {
+                log.error("Could not answer invocation {} after its requester stopped listening", correlationId, e);
+            }
         }
     }
 

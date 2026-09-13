@@ -79,6 +79,11 @@ public interface RpcTestService {
 
     Mono<String> getMonoWithValue();
 
+    /**
+     * Completes with the given value after the delay, off the delivery context.
+     */
+    Mono<String> getMonoAfterDelay(String value, long delayMillis);
+
     Mono<Void> getMonoWithVoidFromEmpty();
 
     Mono<Void> getMonoWithVoidFromNull();
